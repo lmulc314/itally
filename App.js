@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import * as Clipboard from 'expo-clipboard';
 import * as Linking from 'expo-linking';
 import {
   AppState,
@@ -15,7 +16,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // =====================================================================
-// DropLog — daily eye drop tally
+// EyeTally — daily eye drop tally
 //
 // Architecture:
 //   - App owns all state (meds, times, dateKey) and persistence.
@@ -178,7 +179,7 @@ function clampTarget(n) {
 }
 
 // Turn a medication name into its Siri link word:
-// "Vital Tears" -> "vital-tears". Matches incoming droplog://log/ URLs.
+// "Vital Tears" -> "vital-tears". Matches incoming eyetally://log/ URLs.
 function slugify(name) {
   return (name || '')
     .toLowerCase()
@@ -289,7 +290,12 @@ function MedViewCard({
               {med.name || 'Unnamed medication'}
             </Text>
           </View>
-          <Text style={[styles.medCount, finished && styles.medCountDone]}>
+          <Text
+            style={[styles.medCount, finished && styles.medCountDone]}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.6}
+          >
             {finished ? (
               '✓ DONE FOR TODAY'
             ) : (
@@ -302,12 +308,17 @@ function MedViewCard({
             )}
           </Text>
           {!effectiveExpanded && !finished && doseTimes.length > 0 && (
-            <Text style={styles.lastTaken}>
+            <Text
+              style={styles.lastTaken}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.7}
+            >
               Last taken at {formatTime(doseTimes[doseTimes.length - 1])}
             </Text>
           )}
           {effectiveExpanded && med.detail ? (
-            <Text style={styles.medDetail}>{med.detail}</Text>
+            <Text style={styles.medDetail} numberOfLines={2}>{med.detail}</Text>
           ) : null}
           {(!finished || effectiveExpanded) && (
             <Progress done={done} target={med.target} color={med.color} theme={theme} />
@@ -327,7 +338,10 @@ function MedViewCard({
               pressed && styles.pressed,
             ]}
           >
-            <Text style={[styles.plusText, finished && { color: theme.inkSoft }]}>
+            <Text
+              style={[styles.plusText, finished && { color: theme.inkSoft }]}
+              allowFontScaling={false}
+            >
               {finished ? '✓' : '+1'}
             </Text>
           </Pressable>
@@ -356,7 +370,9 @@ function MedViewCard({
               }}
               style={({ pressed }) => [styles.timeChip, pressed && styles.pressed]}
             >
-              <Text style={styles.timeChipText}>{formatTime(iso)} ✎</Text>
+              <Text style={styles.timeChipText} allowFontScaling={false}>
+                {formatTime(iso)} ✎
+              </Text>
             </Pressable>
           ))}
         </View>
@@ -373,17 +389,19 @@ function MedEditCard({ med, confirming, onUpdate, onBumpTarget, onDelete, styles
   return (
     <View style={styles.card}>
       <View style={styles.cardTop}>
-        <View style={[styles.capDot, { backgroundColor: med.color }]} />
         <View style={styles.cardText}>
-          <TextInput
-            style={styles.nameInput}
-            value={med.name}
-            placeholder="Medication name"
-            placeholderTextColor={theme.inkSoft}
-            onFocus={() => setFocused(true)}
-            onBlur={() => setTimeout(() => setFocused(false), 150)}
-            onChangeText={(t) => onUpdate(med.id, { name: t })}
-          />
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <View style={[styles.capDot, { backgroundColor: med.color }]} />
+            <TextInput
+              style={[styles.nameInput, { flex: 1 }]}
+              value={med.name}
+              placeholder="Medication name"
+              placeholderTextColor={theme.inkSoft}
+              onFocus={() => setFocused(true)}
+              onBlur={() => setTimeout(() => setFocused(false), 150)}
+              onChangeText={(t) => onUpdate(med.id, { name: t })}
+            />
+          </View>
           {focused && med.name.trim().length > 0 && !exactLibraryMatch && suggestions.length > 0 && (
             <View style={styles.suggestionList}>
               {suggestions.map((suggestion, i) => (
@@ -417,14 +435,14 @@ function MedEditCard({ med, confirming, onUpdate, onBumpTarget, onDelete, styles
               onPress={() => onBumpTarget(med.id, -1)}
               style={({ pressed }) => [styles.stepBtn, pressed && styles.pressed]}
             >
-              <Text style={styles.stepBtnText}>−</Text>
+              <Text style={styles.stepBtnText} allowFontScaling={false}>−</Text>
             </Pressable>
-            <Text style={styles.targetValue}>{med.target}</Text>
+            <Text style={styles.targetValue} allowFontScaling={false}>{med.target}</Text>
             <Pressable
               onPress={() => onBumpTarget(med.id, 1)}
               style={({ pressed }) => [styles.stepBtn, pressed && styles.pressed]}
             >
-              <Text style={styles.stepBtnText}>+</Text>
+              <Text style={styles.stepBtnText} allowFontScaling={false}>+</Text>
             </Pressable>
           </View>
           <Text style={styles.colorLabel}>Color:</Text>
@@ -440,7 +458,9 @@ function MedEditCard({ med, confirming, onUpdate, onBumpTarget, onDelete, styles
                   pressed && styles.pressed,
                 ]}
               >
-                {med.color === c && <Text style={styles.colorCheck}>✓</Text>}
+                {med.color === c && (
+                  <Text style={styles.colorCheck} allowFontScaling={false}>✓</Text>
+                )}
               </Pressable>
             ))}
           </View>
@@ -535,9 +555,17 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
   const [showHelp, setShowHelp] = useState(false);
+  const [copiedSlug, setCopiedSlug] = useState(null);
   const [themeName, setThemeName] = useState('light');
   const theme = themeName === 'dark' ? DARK_THEME : LIGHT_THEME;
   const styles = React.useMemo(() => makeStyles(theme), [theme]);
+
+  const copySiriLink = async (med) => {
+    const url = `eyetally://log/${slugify(med.name)}`;
+    await Clipboard.setStringAsync(url);
+    setCopiedSlug(slugify(med.name));
+    setTimeout(() => setCopiedSlug(null), 2000);
+  };
 
   // Refs mirror state so long-lived callbacks (interval, AppState,
   // debounced save) always see current values without re-subscribing.
@@ -650,7 +678,7 @@ export default function App() {
     });
   }, [rollDayIfNeeded]);
 
-  // ---- Siri deep links (droplog://log/<medication-name>) ----
+  // ---- Siri deep links (eyetally://log/<medication-name>) ----
   const [pendingLink, setPendingLink] = useState(null);
   const [banner, setBanner] = useState(null);
 
@@ -823,10 +851,25 @@ export default function App() {
       <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
       <ScrollView contentContainerStyle={styles.scroll}>
         <View style={styles.headerRow}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.appTitle}>DropLog</Text>
-            <Text style={styles.date}>{dateLabel}</Text>
-            <Text style={styles.headline}>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text
+              style={styles.appTitle}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.6}
+              allowFontScaling={true}
+            >
+              EyeTally
+            </Text>
+            <Text style={styles.date} numberOfLines={2} allowFontScaling={true}>
+              {dateLabel}
+            </Text>
+            <Text
+              style={styles.headline}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.6}
+            >
               {editMode
                 ? 'Edit medications'
                 : allDone
@@ -834,20 +877,20 @@ export default function App() {
                 : `${totalDone} of ${totalTarget} done`}
             </Text>
           </View>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-start' }}>
+          <View style={{ flexDirection: 'row', alignItems: 'flex-start', flexShrink: 0 }}>
             <Pressable
               onPress={() => setShowHelp(true)}
               style={({ pressed }) => [styles.helpBtn, pressed && styles.pressed]}
               accessibilityLabel="Help"
             >
-              <Text style={styles.helpBtnText}>?</Text>
+              <Text style={styles.helpBtnText} allowFontScaling={false}>?</Text>
             </Pressable>
             <Pressable
               onPress={() => setThemeName(themeName === 'dark' ? 'light' : 'dark')}
               style={({ pressed }) => [styles.themeToggle, pressed && styles.pressed]}
               accessibilityLabel="Toggle dark mode"
             >
-              <Text style={styles.themeToggleText}>
+              <Text style={styles.themeToggleText} allowFontScaling={false}>
                 {themeName === 'dark' ? '☀' : '☾'}
               </Text>
             </Pressable>
@@ -937,7 +980,7 @@ export default function App() {
         <View style={styles.helpBackdrop}>
           <View style={styles.helpCard}>
             <ScrollView>
-              <Text style={styles.helpTitle}>How to use DropLog</Text>
+              <Text style={styles.helpTitle}>How to use EyeTally</Text>
               <Text style={styles.helpSubtitle}>
                 A simple daily tracker for your eye drops.
               </Text>
@@ -969,33 +1012,51 @@ export default function App() {
                 "Hey Siri, log Vital Tears." This takes a one-time setup for
                 each medication:
               </Text>
+              <Text style={styles.helpSectionTitle}>Your Siri links</Text>
+              <Text style={styles.helpBody}>
+                Tap a link below to copy it.
+              </Text>
+              {meds.map((med) => {
+                const slug = slugify(med.name);
+                const isCopied = copiedSlug === slug;
+                return (
+                  <Pressable
+                    key={med.id}
+                    onPress={() => copySiriLink(med)}
+                    style={({ pressed }) => [
+                      styles.siriLinkRow,
+                      isCopied && styles.siriLinkRowCopied,
+                      pressed && styles.pressed,
+                    ]}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.siriLinkName}>{med.name || 'Unnamed'}</Text>
+                      <Text style={styles.siriLinkUrl}>eyetally://log/{slug}</Text>
+                    </View>
+                    <Text style={styles.siriLinkCopyLabel}>
+                      {isCopied ? 'Copied ✓' : 'Copy'}
+                    </Text>
+                  </Pressable>
+                );
+              })}
               <Text style={styles.helpStep}>
-                1. Open the Shortcuts app on your iPhone (it's built in).
+                1. Pick a medication above and tap "Copy" to copy its link.
               </Text>
               <Text style={styles.helpStep}>
-                2. Tap the + in the top right, then "Add Action."
+                2. Open the Shortcuts app.
               </Text>
               <Text style={styles.helpStep}>
-                3. Search for "Open URL" and tap it.
+                3. Tap + then "Add Action" then "Open URL."
               </Text>
               <Text style={styles.helpStep}>
-                4. In the URL field, type your medication's link. For a
-                medication named "Vital Tears," type:
-              </Text>
-              <Text style={styles.helpCode}>droplog://log/vital-tears</Text>
-              <Text style={styles.helpStep}>
-                Use lowercase and replace spaces with dashes.
+                4. Paste the copied link into the URL field.
               </Text>
               <Text style={styles.helpStep}>
-                5. Tap the shortcut's name at the top and rename it to
-                something you'd say to Siri, like "Log Vital Tears."
+                5. Tap the shortcut's name at the top. Rename it to what you'll
+                say to Siri — for example, "Log Vital Tears."
               </Text>
               <Text style={styles.helpStep}>
-                6. Done. Now you can say "Hey Siri, log Vital Tears" and
-                DropLog will open and record the dose automatically.
-              </Text>
-              <Text style={styles.helpStep}>
-                Repeat for each medication.
+                6. Repeat steps 1 through 5 for each medication.
               </Text>
 
               <Pressable
@@ -1026,8 +1087,11 @@ const makeStyles = (t) => StyleSheet.create({
   scroll: { padding: 18, paddingBottom: 44 },
 
   headerRow: {
-    flexDirection: 'row', alignItems: 'flex-start',
-    marginBottom: 20, marginTop: 4,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 20,
+    marginTop: 4,
+    gap: 8,
   },
 
   appTitle: {
@@ -1153,7 +1217,7 @@ const makeStyles = (t) => StyleSheet.create({
     fontSize: 15, color: t.ink, fontWeight: '500', marginRight: 10,
   },
   stepBtn: {
-    width: 44, height: 44, borderRadius: 22,
+    width: 52, height: 52, borderRadius: 26,
     backgroundColor: t.cream,
     borderWidth: 1, borderColor: t.hairline,
     alignItems: 'center', justifyContent: 'center',
@@ -1168,10 +1232,9 @@ const makeStyles = (t) => StyleSheet.create({
     fontSize: 15, color: t.ink, fontWeight: '500',
     marginTop: 16, marginBottom: 10,
   },
-  colorRow: { flexDirection: 'row', flexWrap: 'wrap' },
+  colorRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
   colorSwatch: {
     width: 40, height: 40, borderRadius: 20,
-    marginRight: 10, marginBottom: 10,
     alignItems: 'center', justifyContent: 'center',
     borderWidth: 2, borderColor: 'transparent',
   },
@@ -1292,6 +1355,38 @@ const makeStyles = (t) => StyleSheet.create({
     paddingVertical: 14, alignItems: 'center', marginTop: 24,
   },
   helpCloseText: { color: t.card, fontSize: 17, fontWeight: '600' },
+  siriLinkRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: t.bg,
+    borderWidth: 1,
+    borderColor: t.hairline,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginTop: 10,
+  },
+  siriLinkRowCopied: {
+    backgroundColor: t.cream,
+    borderColor: t.done,
+  },
+  siriLinkName: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: t.ink,
+  },
+  siriLinkUrl: {
+    fontSize: 13,
+    color: t.inkSoft,
+    fontFamily: 'Courier',
+    marginTop: 2,
+  },
+  siriLinkCopyLabel: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: t.ink,
+    marginLeft: 12,
+  },
 
   themeToggle: {
     marginTop: 6, marginLeft: 8,
