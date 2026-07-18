@@ -1059,6 +1059,15 @@ export default function App() {
                 6. Repeat steps 1 through 5 for each medication.
               </Text>
 
+              <Text style={styles.helpSectionTitle}>Important</Text>
+              <Text style={styles.helpDisclaimer}>
+                EyeTally is a personal tracker, not medical advice. Always follow
+                the schedule and instructions from your doctor or pharmacist. If
+                you miss a dose, are unsure whether you took one, or have questions
+                about your medications, contact your healthcare provider — do not
+                rely on this app to make medical decisions. In an emergency, call 911.
+              </Text>
+
               <Pressable
                 onPress={() => setShowHelp(false)}
                 style={({ pressed }) => [styles.helpClose, pressed && styles.pressed]}
@@ -1338,6 +1347,18 @@ const makeStyles = (t) => StyleSheet.create({
   helpStep: {
     fontSize: 16, color: t.ink, lineHeight: 24, marginTop: 8,
     fontWeight: '400',
+  },
+  helpDisclaimer: {
+    fontSize: 15,
+    color: t.ink,
+    lineHeight: 22,
+    fontWeight: '500',
+    backgroundColor: t.cream,
+    borderWidth: 1,
+    borderColor: t.hairline,
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 8,
   },
   helpCode: {
     fontFamily: 'Courier',
