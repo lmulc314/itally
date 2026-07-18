@@ -3,19 +3,12 @@
     "name": "EyeTally",
     "slug": "itally",
     "scheme": "eyetally",
-    "version": "1.0.1",
+    "version": "1.0.3",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "splash": {
-      "image": "./assets/icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#000000"
-    },
-    "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "com.mulcahy.itally",
-      "infoPlist": {
+    "splash": { 
+      "image": "./assets/icon.png",/
         "ITSAppUsesNonExemptEncryption": false
       }
     },
