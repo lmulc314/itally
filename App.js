@@ -1068,6 +1068,18 @@ export default function App() {
                 rely on this app to make medical decisions. In an emergency, call 911.
               </Text>
 
+              <Text style={styles.helpSectionTitle}>Privacy</Text>
+              <Text style={styles.helpBody}>
+                EyeTally stores everything on your device only. Nothing is
+                collected, shared, or sent to any server. Read the full policy:
+              </Text>
+              <Pressable
+                onPress={() => Linking.openURL('https://lmulc314.github.io/itally/privacy.html')}
+                style={({ pressed }) => [styles.privacyLink, pressed && styles.pressed]}
+              >
+                <Text style={styles.privacyLinkText}>View Privacy Policy →</Text>
+              </Pressable>
+
               <Pressable
                 onPress={() => setShowHelp(false)}
                 style={({ pressed }) => [styles.helpClose, pressed && styles.pressed]}
@@ -1359,6 +1371,20 @@ const makeStyles = (t) => StyleSheet.create({
     borderRadius: 12,
     padding: 14,
     marginTop: 8,
+  },
+  privacyLink: {
+    backgroundColor: t.cream,
+    borderWidth: 1,
+    borderColor: t.hairline,
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 10,
+    alignItems: 'center',
+  },
+  privacyLinkText: {
+    fontSize: 16,
+    color: t.ink,
+    fontWeight: '600',
   },
   helpCode: {
     fontFamily: 'Courier',
