@@ -849,7 +849,7 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
-      <ScrollView contentContainerStyle={styles.scroll}>
+      <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
         <View style={styles.headerRow}>
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text
