@@ -3,8 +3,11 @@
     "name": "EyeTally",
     "slug": "itally",
     "scheme": "eyetally",
-    "version": "1.0.4",
+    "version": "1.0.5",
     "orientation": "portrait",
+    "plugins": [
+      "expo-notifications"
+    ],
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "splash": {

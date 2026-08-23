@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as Clipboard from 'expo-clipboard';
 import * as Linking from 'expo-linking';
+import * as Notifications from 'expo-notifications';
 import {
   AppState,
   Modal,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -14,6 +16,15 @@ import {
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  endConnection,
+  finishTransaction,
+  getAvailablePurchases,
+  initConnection,
+  purchaseErrorListener,
+  purchaseUpdatedListener,
+  requestPurchase,
+} from 'react-native-iap';
 
 // =====================================================================
 // EyeTally — daily eye drop tally
@@ -146,9 +157,20 @@ const DARK_THEME = {
 // existing DEFAULT_MEDS colors already come from this list.
 
 const STORAGE_KEY = 'eyedrop-tracker-v3';
+const TRIAL_START_KEY = 'eyetally_trial_start';
+const FULL_UNLOCK_KEY = 'eyetally_full_unlock';
+const TRIAL_MIGRATION_KEY = 'eyetally_migration_v1_5_complete';
+const FULL_UNLOCK_SKU = 'com.mulcahy.itally.fullunlock';
+const REMINDER_CATEGORY_ID = 'eyetally_dose_reminder';
+const REMINDER_MARK_TAKEN_ACTION_ID = 'eyetally_mark_taken';
+const REMINDER_NOTIFICATION_TYPE = 'eyetally-dose-reminder';
+const REMINDER_CHANNEL_ID = 'eyetally-reminders';
 const MIN_TARGET = 1;
 const MAX_TARGET = 24;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const TRIAL_LENGTH_MS = 3 * DAY_MS;
 const DAY_CHECK_MS = 30 * 1000;   // how often to check for midnight rollover
+const TRIAL_CHECK_MS = 60 * 1000;  // how often to re-check trial expiry while open
 const SAVE_DEBOUNCE_MS = 400;     // batch rapid changes (typing) into one write
 const CONFIRM_RESET_MS = 5000;    // auto-disarm a pending delete confirmation
 
@@ -177,6 +199,320 @@ function formatTime(iso) {
 function clampTarget(n) {
   return Math.max(MIN_TARGET, Math.min(MAX_TARGET, Math.round(n)));
 }
+
+function clampHour(n) {
+  const h = Math.round(Number(n));
+  if (!Number.isFinite(h)) return 9;
+  return ((h % 24) + 24) % 24;
+}
+
+function clampMinute(n) {
+  const m = Math.round(Number(n));
+  if (!Number.isFinite(m)) return 0;
+  return Math.max(0, Math.min(59, m));
+}
+
+function sanitizeReminders(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((r) => r && typeof r === 'object')
+    .map((r, i) => ({
+      id: typeof r.id === 'string' && r.id.length > 0
+        ? r.id
+        : `reminder-${Date.now()}-${i}`,
+      hour: clampHour(r.hour),
+      minute: clampMinute(r.minute),
+      notificationId:
+        typeof r.notificationId === 'string' && r.notificationId.length > 0
+          ? r.notificationId
+          : null,
+    }));
+}
+
+function formatReminderTime(reminder) {
+  const d = new Date();
+  d.setHours(clampHour(reminder.hour), clampMinute(reminder.minute), 0, 0);
+  return d.toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function makeReminderFromDate(date = new Date()) {
+  const d = new Date(date);
+  d.setHours(d.getHours() + 1, 0, 0, 0);
+  return {
+    id: `reminder-${Date.now()}`,
+    hour: d.getHours(),
+    minute: d.getMinutes(),
+    notificationId: null,
+  };
+}
+
+function isStorePlatform() {
+  return Platform.OS === 'ios' || Platform.OS === 'android';
+}
+
+function ownsFullUnlock(purchase) {
+  if (!purchase || typeof purchase !== 'object') return false;
+  if (purchase.productId === FULL_UNLOCK_SKU) return true;
+  return Array.isArray(purchase.ids) && purchase.ids.includes(FULL_UNLOCK_SKU);
+}
+
+function verifyFullUnlockReceipt(purchase) {
+  if (!ownsFullUnlock(purchase)) return false;
+  if (purchase.purchaseState === 'pending') return false;
+  return Boolean(purchase.id || purchase.transactionId || purchase.purchaseToken);
+}
+
+function friendlyPurchaseError(error, fallback) {
+  const message = typeof error?.message === 'string' ? error.message : '';
+  if (message.toLowerCase().includes('cancel')) return 'Purchase cancelled.';
+  return message || fallback;
+}
+
+async function hasPreExistingAppData(storage = AsyncStorage) {
+  const raw = await storage.getItem(STORAGE_KEY);
+  if (!raw) return false;
+
+  try {
+    const saved = JSON.parse(raw);
+    return Boolean(
+      sanitizeMeds(saved?.meds) ||
+      saved?.date ||
+      saved?.theme === 'dark' ||
+      saved?.theme === 'light' ||
+      Object.values(saved?.times || {}).some(
+        (arr) => Array.isArray(arr) && arr.length > 0
+      )
+    );
+  } catch (e) {
+    return true;
+  }
+}
+
+async function getTrialStatus(now = Date.now(), storage = AsyncStorage) {
+  let rawStart = await storage.getItem(TRIAL_START_KEY);
+  let trialStart = Number(rawStart);
+
+  if (!rawStart || !Number.isFinite(trialStart) || trialStart <= 0) {
+    trialStart = now;
+    await storage.setItem(TRIAL_START_KEY, String(trialStart));
+  }
+
+  const msRemaining = trialStart + TRIAL_LENGTH_MS - now;
+  return {
+    isTrialActive: msRemaining > 0,
+    daysRemaining: Math.max(0, Math.ceil(msRemaining / DAY_MS)),
+  };
+}
+
+async function getStoredFullUnlock(storage = AsyncStorage) {
+  return (await storage.getItem(FULL_UNLOCK_KEY)) === 'true';
+}
+
+async function storeFullUnlock(value, storage = AsyncStorage) {
+  await storage.setItem(FULL_UNLOCK_KEY, value ? 'true' : 'false');
+}
+
+async function initializeAccessState(now = Date.now(), storage = AsyncStorage) {
+  const purchased = await getStoredFullUnlock(storage);
+  const migrationComplete = (await storage.getItem(TRIAL_MIGRATION_KEY)) === 'true';
+
+  if (purchased) {
+    if (!migrationComplete) {
+      await storage.setItem(TRIAL_MIGRATION_KEY, 'true');
+    }
+    return {
+      hasPurchasedFullUnlock: true,
+      trialStatus: { isTrialActive: false, daysRemaining: 0 },
+    };
+  }
+
+  const rawTrialStart = await storage.getItem(TRIAL_START_KEY);
+
+  if (!migrationComplete) {
+    if (!rawTrialStart && (await hasPreExistingAppData(storage))) {
+      await storeFullUnlock(true, storage);
+      await storage.setItem(TRIAL_MIGRATION_KEY, 'true');
+      return {
+        hasPurchasedFullUnlock: true,
+        trialStatus: { isTrialActive: false, daysRemaining: 0 },
+      };
+    }
+
+    await storage.setItem(TRIAL_MIGRATION_KEY, 'true');
+  }
+
+  return {
+    hasPurchasedFullUnlock: false,
+    trialStatus: await getTrialStatus(now, storage),
+  };
+}
+
+async function purchaseFullUnlock() {
+  if (!isStorePlatform()) {
+    throw new Error('Purchases are available only in the iOS or Android app.');
+  }
+
+  await requestPurchase({
+    request: {
+      apple: { sku: FULL_UNLOCK_SKU },
+      google: { skus: [FULL_UNLOCK_SKU] },
+    },
+    type: 'in-app',
+  });
+}
+
+function notificationsAllowed(settings) {
+  return Boolean(
+    settings?.granted ||
+    settings?.status === 'granted' ||
+    settings?.ios?.status === Notifications.IosAuthorizationStatus?.AUTHORIZED ||
+    settings?.ios?.status === Notifications.IosAuthorizationStatus?.PROVISIONAL ||
+    settings?.ios?.status === Notifications.IosAuthorizationStatus?.EPHEMERAL
+  );
+}
+
+function notificationsDenied(settings) {
+  return Boolean(
+    settings?.status === 'denied' ||
+    settings?.ios?.status === Notifications.IosAuthorizationStatus?.DENIED
+  );
+}
+
+async function setupReminderNotificationsAsync() {
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync(REMINDER_CHANNEL_ID, {
+      name: 'EyeTally reminders',
+      importance: Notifications.AndroidImportance.DEFAULT,
+    });
+  }
+
+  await Notifications.setNotificationCategoryAsync(REMINDER_CATEGORY_ID, [
+    {
+      identifier: REMINDER_MARK_TAKEN_ACTION_ID,
+      buttonTitle: 'Mark as Taken',
+      options: {
+        opensAppToForeground: false,
+      },
+    },
+  ]);
+}
+
+async function getReminderPermissionStatus() {
+  try {
+    return await Notifications.getPermissionsAsync();
+  } catch (e) {
+    return { status: 'denied', granted: false };
+  }
+}
+
+async function scheduleDoseReminder(med, reminder) {
+  await setupReminderNotificationsAsync();
+  return await Notifications.scheduleNotificationAsync({
+    content: {
+      title: med.name ? `Time for ${med.name}` : 'EyeTally reminder',
+      body: med.detail || 'Time for your eye drops.',
+      categoryIdentifier: REMINDER_CATEGORY_ID,
+      data: {
+        type: REMINDER_NOTIFICATION_TYPE,
+        medId: med.id,
+        reminderId: reminder.id,
+      },
+      sound: 'default',
+    },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DAILY,
+      hour: clampHour(reminder.hour),
+      minute: clampMinute(reminder.minute),
+      channelId: REMINDER_CHANNEL_ID,
+    },
+  });
+}
+
+async function cancelReminderNotification(reminder) {
+  if (!reminder?.notificationId) return;
+  try {
+    await Notifications.cancelScheduledNotificationAsync(reminder.notificationId);
+  } catch (e) {}
+}
+
+async function cancelMedicationReminderNotifications(med) {
+  const reminders = sanitizeReminders(med?.reminders);
+  await Promise.all(reminders.map(cancelReminderNotification));
+}
+
+async function isMedicationDoneToday(medId, storage = AsyncStorage) {
+  try {
+    const raw = await storage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    const saved = JSON.parse(raw);
+    const meds = sanitizeMeds(saved.meds) || DEFAULT_MEDS;
+    const med = meds.find((m) => m.id === medId);
+    if (!med || saved.date !== todayString()) return false;
+    const times = sanitizeTimes(saved.times, meds);
+    return (times[medId] || []).length >= med.target;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function logDoseInStoredData(medId, storage = AsyncStorage) {
+  const raw = await storage.getItem(STORAGE_KEY);
+  const saved = raw ? JSON.parse(raw) : {};
+  const meds = sanitizeMeds(saved.meds) || DEFAULT_MEDS;
+  const med = meds.find((m) => m.id === medId);
+  if (!med) {
+    return { logged: false, reason: 'missing' };
+  }
+
+  const date = todayString();
+  const times =
+    saved.date === date
+      ? sanitizeTimes(saved.times, meds)
+      : emptyTimes(meds);
+  const arr = times[medId] || [];
+
+  if (arr.length >= med.target) {
+    return { logged: false, reason: 'done', date, meds, times, medName: med.name };
+  }
+
+  const nextTimes = {
+    ...times,
+    [medId]: [...arr, new Date().toISOString()].sort(),
+  };
+  const nextSaved = {
+    date,
+    meds,
+    times: nextTimes,
+  };
+  if (saved.theme === 'dark' || saved.theme === 'light') {
+    nextSaved.theme = saved.theme;
+  }
+
+  await storage.setItem(STORAGE_KEY, JSON.stringify(nextSaved));
+  return { logged: true, date, meds, times: nextTimes, medName: med.name };
+}
+
+// Expo can only run this suppression check when JS is active.
+// Background iOS local notifications may still show if the dose was already met.
+Notifications.setNotificationHandler({
+  handleNotification: async (notification) => {
+    const data = notification?.request?.content?.data || {};
+    const shouldSuppress =
+      data.type === REMINDER_NOTIFICATION_TYPE &&
+      data.medId &&
+      (await isMedicationDoneToday(data.medId));
+
+    return {
+      shouldShowBanner: !shouldSuppress,
+      shouldShowList: !shouldSuppress,
+      shouldPlaySound: !shouldSuppress,
+      shouldSetBadge: false,
+    };
+  },
+});
 
 // Turn a medication name into its Siri link word:
 // "Vital Tears" -> "vital-tears". Matches incoming eyetally://log/ URLs.
@@ -212,6 +548,7 @@ function sanitizeMeds(raw) {
       color: typeof m.color === 'string' && /^#[0-9A-Fa-f]{6}$/.test(m.color)
         ? m.color
         : PALETTE[i % PALETTE.length],
+      reminders: sanitizeReminders(m.reminders),
     }));
   return cleaned.length > 0 ? cleaned : null;
 }
@@ -381,10 +718,22 @@ function MedViewCard({
   );
 }
 
-function MedEditCard({ med, confirming, onUpdate, onBumpTarget, onDelete, styles, theme }) {
+function MedEditCard({
+  med,
+  confirming,
+  onUpdate,
+  onBumpTarget,
+  onDelete,
+  onAddReminder,
+  onEditReminder,
+  onDeleteReminder,
+  styles,
+  theme,
+}) {
   const [focused, setFocused] = useState(false);
   const suggestions = librarySuggestions(med.name);
   const exactLibraryMatch = MED_LIBRARY.some((m) => m.name === med.name);
+  const reminders = sanitizeReminders(med.reminders);
 
   return (
     <View style={styles.card}>
@@ -463,6 +812,33 @@ function MedEditCard({ med, confirming, onUpdate, onBumpTarget, onDelete, styles
                 )}
               </Pressable>
             ))}
+          </View>
+          <View style={styles.remindersSection}>
+            <Text style={styles.remindersTitle}>Reminders</Text>
+            {reminders.length > 0 && reminders.map((reminder) => (
+              <View key={reminder.id} style={styles.reminderRow}>
+                <Pressable
+                  onPress={() => onEditReminder(med.id, reminder.id)}
+                  style={({ pressed }) => [styles.reminderTimeBtn, pressed && styles.pressed]}
+                >
+                  <Text style={styles.reminderTimeText}>
+                    {formatReminderTime(reminder)}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => onDeleteReminder(med.id, reminder.id)}
+                  style={({ pressed }) => [styles.reminderRemoveBtn, pressed && styles.pressed]}
+                >
+                  <Text style={styles.reminderRemoveText}>Remove</Text>
+                </Pressable>
+              </View>
+            ))}
+            <Pressable
+              onPress={() => onAddReminder(med.id)}
+              style={({ pressed }) => [styles.addReminderBtn, pressed && styles.pressed]}
+            >
+              <Text style={styles.addReminderText}>Add Reminder Time</Text>
+            </Pressable>
           </View>
         </View>
       </View>
@@ -543,6 +919,120 @@ function TimeEditModal({ editing, medName, onBump, onSave, onDelete, onCancel, s
   );
 }
 
+function ReminderTimeModal({ editing, medName, onBump, onSave, onCancel, styles }) {
+  return (
+    <Modal visible={!!editing} transparent animationType="fade">
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalCard}>
+          <Text style={styles.modalTitle}>{medName} reminder</Text>
+          {editing && (
+            <View style={styles.pickerRow}>
+              <View style={styles.pickerCol}>
+                <Pressable onPress={() => onBump('hour', 1)} style={styles.pickBtn}>
+                  <Text style={styles.pickBtnText}>▲</Text>
+                </Pressable>
+                <Text style={styles.pickValue}>{editing.hour}</Text>
+                <Pressable onPress={() => onBump('hour', -1)} style={styles.pickBtn}>
+                  <Text style={styles.pickBtnText}>▼</Text>
+                </Pressable>
+              </View>
+              <Text style={styles.pickColon}>:</Text>
+              <View style={styles.pickerCol}>
+                <Pressable onPress={() => onBump('minute', 5)} style={styles.pickBtn}>
+                  <Text style={styles.pickBtnText}>▲</Text>
+                </Pressable>
+                <Text style={styles.pickValue}>
+                  {String(editing.minute).padStart(2, '0')}
+                </Text>
+                <Pressable onPress={() => onBump('minute', -5)} style={styles.pickBtn}>
+                  <Text style={styles.pickBtnText}>▼</Text>
+                </Pressable>
+              </View>
+              <Pressable
+                onPress={() => onBump('am')}
+                style={({ pressed }) => [styles.ampmBtn, pressed && styles.pressed]}
+              >
+                <Text style={styles.ampmText}>{editing.am ? 'AM' : 'PM'}</Text>
+              </Pressable>
+            </View>
+          )}
+          <Pressable
+            onPress={onSave}
+            style={({ pressed }) => [styles.modalSave, pressed && styles.pressed]}
+          >
+            <Text style={styles.modalSaveText}>Save reminder</Text>
+          </Pressable>
+          <Pressable
+            onPress={onCancel}
+            style={({ pressed }) => [styles.modalCancel, pressed && styles.pressed]}
+          >
+            <Text style={styles.modalCancelText}>Cancel</Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function PaywallScreen({
+  styles,
+  themeName,
+  onPurchase,
+  onRestore,
+  purchaseBusy,
+  restoreBusy,
+  error,
+}) {
+  const busy = purchaseBusy || restoreBusy;
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
+      <View style={styles.paywallWrap}>
+        <View style={styles.paywallCard}>
+          <Text style={styles.paywallEyebrow}>EyeTally</Text>
+          <Text style={styles.paywallTitle}>
+            Your 3-day free trial has ended.
+          </Text>
+          <Text style={styles.paywallBody}>
+            Unlock EyeTally to keep tracking your eye drops.
+          </Text>
+
+          {error ? <Text style={styles.paywallError}>{error}</Text> : null}
+
+          <Pressable
+            onPress={onPurchase}
+            disabled={busy}
+            style={({ pressed }) => [
+              styles.paywallButton,
+              busy && styles.disabled,
+              pressed && styles.pressed,
+            ]}
+          >
+            <Text style={styles.paywallButtonText}>
+              {purchaseBusy ? 'Starting purchase...' : 'Unlock for $2.99'}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            onPress={onRestore}
+            disabled={busy}
+            style={({ pressed }) => [
+              styles.restoreLink,
+              busy && styles.disabled,
+              pressed && styles.pressed,
+            ]}
+          >
+            <Text style={styles.restoreLinkText}>
+              {restoreBusy ? 'Restoring...' : 'Restore Purchase'}
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+    </SafeAreaView>
+  );
+}
+
 // ---- App --------------------------------------------------------------
 
 export default function App() {
@@ -552,13 +1042,81 @@ export default function App() {
   const [editMode, setEditMode] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(null);
   const [editingTime, setEditingTime] = useState(null);
+  const [editingReminder, setEditingReminder] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
   const [showHelp, setShowHelp] = useState(false);
   const [copiedSlug, setCopiedSlug] = useState(null);
+  const [banner, setBanner] = useState(null);
   const [themeName, setThemeName] = useState('light');
+  const [accessLoaded, setAccessLoaded] = useState(false);
+  const [trialStatus, setTrialStatus] = useState({
+    isTrialActive: false,
+    daysRemaining: 0,
+  });
+  const [hasPurchasedFullUnlock, setHasPurchasedFullUnlock] = useState(false);
+  const [initialRestoreChecked, setInitialRestoreChecked] = useState(!isStorePlatform());
+  const [purchaseBusy, setPurchaseBusy] = useState(false);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [paywallError, setPaywallError] = useState(null);
   const theme = themeName === 'dark' ? DARK_THEME : LIGHT_THEME;
   const styles = React.useMemo(() => makeStyles(theme), [theme]);
+
+  const markFullUnlockPurchased = useCallback(async () => {
+    await storeFullUnlock(true);
+    setHasPurchasedFullUnlock(true);
+    setPaywallError(null);
+  }, []);
+
+  const refreshTrialState = useCallback(async () => {
+    const status = await getTrialStatus();
+    setTrialStatus(status);
+    return status;
+  }, []);
+
+  const restorePurchases = useCallback(async () => {
+    if (!isStorePlatform()) {
+      throw new Error('Restore is available only in the iOS or Android app.');
+    }
+
+    const purchases = await getAvailablePurchases();
+    const fullUnlock = purchases.find(ownsFullUnlock);
+    if (!fullUnlock || !verifyFullUnlockReceipt(fullUnlock)) return false;
+
+    await markFullUnlockPurchased();
+    return true;
+  }, [markFullUnlockPurchased]);
+
+  const handlePurchaseFullUnlock = useCallback(async () => {
+    setPaywallError(null);
+    setPurchaseBusy(true);
+    try {
+      await purchaseFullUnlock();
+    } catch (error) {
+      setPaywallError(
+        friendlyPurchaseError(error, 'Unable to start purchase. Please try again.')
+      );
+    } finally {
+      setPurchaseBusy(false);
+    }
+  }, []);
+
+  const handleRestorePurchases = useCallback(async () => {
+    setPaywallError(null);
+    setRestoreBusy(true);
+    try {
+      const restored = await restorePurchases();
+      if (!restored) {
+        setPaywallError('No previous EyeTally unlock was found.');
+      }
+    } catch (error) {
+      setPaywallError(
+        friendlyPurchaseError(error, 'Unable to restore purchase. Please try again.')
+      );
+    } finally {
+      setRestoreBusy(false);
+    }
+  }, [restorePurchases]);
 
   const copySiriLink = async (med) => {
     const url = `eyetally://log/${slugify(med.name)}`;
@@ -573,10 +1131,122 @@ export default function App() {
   const timesRef = useRef(times);
   const dateKeyRef = useRef(dateKey);
   const loadedRef = useRef(loaded);
+  const handledNotificationResponsesRef = useRef(new Set());
   useEffect(() => { medsRef.current = meds; }, [meds]);
   useEffect(() => { timesRef.current = times; }, [times]);
   useEffect(() => { dateKeyRef.current = dateKey; }, [dateKey]);
   useEffect(() => { loadedRef.current = loaded; }, [loaded]);
+
+  const showNotificationSettingsMessage = useCallback(() => {
+    setBanner('Notifications are off. Enable them in iOS Settings to use reminders.');
+  }, []);
+
+  const ensureReminderPermission = useCallback(async () => {
+    await setupReminderNotificationsAsync();
+    const existing = await getReminderPermissionStatus();
+    if (notificationsAllowed(existing)) return true;
+    if (notificationsDenied(existing)) {
+      showNotificationSettingsMessage();
+      return false;
+    }
+
+    const requested = await Notifications.requestPermissionsAsync({
+      ios: {
+        allowAlert: true,
+        allowSound: true,
+        allowBadge: false,
+      },
+    });
+
+    if (notificationsAllowed(requested)) return true;
+    showNotificationSettingsMessage();
+    return false;
+  }, [showNotificationSettingsMessage]);
+
+  // ---- Trial / purchase access ----
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      try {
+        const { trialStatus: status, hasPurchasedFullUnlock: purchased } =
+          await initializeAccessState();
+        if (!alive) return;
+        setTrialStatus(status);
+        setHasPurchasedFullUnlock(purchased);
+      } catch (e) {
+        if (!alive) return;
+        setTrialStatus({ isTrialActive: true, daysRemaining: 3 });
+        setHasPurchasedFullUnlock(false);
+      } finally {
+        if (alive) setAccessLoaded(true);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (hasPurchasedFullUnlock) return undefined;
+    const id = setInterval(() => {
+      refreshTrialState().catch(() => {});
+    }, TRIAL_CHECK_MS);
+    return () => clearInterval(id);
+  }, [hasPurchasedFullUnlock, refreshTrialState]);
+
+  useEffect(() => {
+    if (!isStorePlatform()) return undefined;
+    let alive = true;
+
+    const purchaseSub = purchaseUpdatedListener(async (purchase) => {
+      if (!verifyFullUnlockReceipt(purchase)) return;
+      setPurchaseBusy(true);
+      try {
+        await markFullUnlockPurchased();
+        await finishTransaction({ purchase, isConsumable: false });
+      } catch (error) {
+        if (alive) {
+          setPaywallError(
+            friendlyPurchaseError(error, 'Purchase completed, but finalization failed.')
+          );
+        }
+      } finally {
+        if (alive) setPurchaseBusy(false);
+      }
+    });
+
+    const errorSub = purchaseErrorListener((error) => {
+      if (!alive) return;
+      setPurchaseBusy(false);
+      setPaywallError(
+        friendlyPurchaseError(error, 'Purchase failed. Please try again.')
+      );
+    });
+
+    (async () => {
+      try {
+        await initConnection();
+        if (alive) await restorePurchases();
+      } catch (error) {
+        if (alive) {
+          setPaywallError(
+            friendlyPurchaseError(error, 'Purchases are unavailable right now.')
+          );
+        }
+      } finally {
+        if (alive) setInitialRestoreChecked(true);
+      }
+    })();
+
+    return () => {
+      alive = false;
+      purchaseSub.remove();
+      errorSub.remove();
+      endConnection().catch(() => {});
+    };
+  }, [markFullUnlockPurchased, restorePurchases]);
 
   // ---- Load once on start ----
   useEffect(() => {
@@ -625,6 +1295,47 @@ export default function App() {
     saveTimer.current = setTimeout(saveNow, SAVE_DEBOUNCE_MS);
     return () => clearTimeout(saveTimer.current);
   }, [meds, times, dateKey, themeName, loaded, saveNow]);
+
+  const reconcileReminderSchedules = useCallback(async () => {
+    const permission = await getReminderPermissionStatus();
+    if (!notificationsAllowed(permission)) return;
+
+    await setupReminderNotificationsAsync();
+    const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+    const scheduledIds = new Set(scheduled.map((n) => n.identifier));
+    const currentMeds = medsRef.current;
+    let changed = false;
+
+    const nextMeds = await Promise.all(
+      currentMeds.map(async (med) => {
+        const reminders = sanitizeReminders(med.reminders);
+        if (reminders.length === 0) return { ...med, reminders };
+
+        const nextReminders = [];
+        for (const reminder of reminders) {
+          if (reminder.notificationId && scheduledIds.has(reminder.notificationId)) {
+            nextReminders.push(reminder);
+          } else {
+            try {
+              const notificationId = await scheduleDoseReminder(med, reminder);
+              nextReminders.push({ ...reminder, notificationId });
+              changed = true;
+            } catch (e) {
+              nextReminders.push(reminder);
+            }
+          }
+        }
+        return { ...med, reminders: nextReminders };
+      })
+    );
+
+    if (changed) setMeds(nextMeds);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    reconcileReminderSchedules().catch(() => {});
+  }, [loaded, reconcileReminderSchedules]);
 
   // ---- Daily rollover ----
   // Resets today's tally when the date changes. Returns true if it reset.
@@ -678,9 +1389,46 @@ export default function App() {
     });
   }, [rollDayIfNeeded]);
 
+  const handleReminderNotificationResponse = useCallback(async (response) => {
+    if (!response || response.actionIdentifier !== REMINDER_MARK_TAKEN_ACTION_ID) return;
+    const notification = response.notification;
+    const key = `${notification?.request?.identifier || 'unknown'}:${response.actionIdentifier}`;
+    if (handledNotificationResponsesRef.current.has(key)) return;
+    handledNotificationResponsesRef.current.add(key);
+
+    const data = notification?.request?.content?.data || {};
+    if (data.type !== REMINDER_NOTIFICATION_TYPE || !data.medId) return;
+
+    try {
+      const result = await logDoseInStoredData(data.medId);
+      if (result.meds && result.times && result.date) {
+        setMeds(result.meds);
+        setTimes(result.times);
+        setDateKey(result.date);
+      }
+      if (result.logged) {
+        setBanner(`✓ Logged ${result.medName || 'medication'}`);
+      } else if (result.reason === 'done') {
+        setBanner(`${result.medName || 'Medication'} is already done for today`);
+      }
+    } catch (e) {
+      setBanner('Could not log that reminder dose.');
+    }
+  }, []);
+
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener(
+      handleReminderNotificationResponse
+    );
+    Notifications.getLastNotificationResponseAsync()
+      .then(handleReminderNotificationResponse)
+      .then(() => Notifications.clearLastNotificationResponseAsync?.())
+      .catch(() => {});
+    return () => sub.remove();
+  }, [handleReminderNotificationResponse]);
+
   // ---- Siri deep links (eyetally://log/<medication-name>) ----
   const [pendingLink, setPendingLink] = useState(null);
-  const [banner, setBanner] = useState(null);
 
   useEffect(() => {
     Linking.getInitialURL().then((url) => {
@@ -812,7 +1560,7 @@ export default function App() {
     const id = 'med-' + Date.now();
     setMeds((prev) => {
       const color = PALETTE[prev.length % PALETTE.length];
-      return [...prev, { id, name: '', detail: '', target: 1, color }];
+      return [...prev, { id, name: '', detail: '', target: 1, color, reminders: [] }];
     });
     setTimes((prev) => ({ ...prev, [id]: [] }));
   }, []);
@@ -820,6 +1568,8 @@ export default function App() {
   const deleteMed = useCallback((id) => {
     setConfirmingDelete((current) => {
       if (current !== id) return id; // first tap arms the confirmation
+      const med = medsRef.current.find((m) => m.id === id);
+      cancelMedicationReminderNotifications(med).catch(() => {});
       setMeds((prev) => prev.filter((m) => m.id !== id));
       setTimes((prev) => {
         const next = { ...prev };
@@ -828,6 +1578,134 @@ export default function App() {
       });
       return null;
     });
+  }, []);
+
+  const addReminder = useCallback(async (medId) => {
+    const med = medsRef.current.find((m) => m.id === medId);
+    if (!med) return;
+
+    const allowed = await ensureReminderPermission();
+    if (!allowed) return;
+
+    const reminder = makeReminderFromDate();
+    try {
+      const notificationId = await scheduleDoseReminder(med, reminder);
+      setMeds((prev) =>
+        prev.map((m) =>
+          m.id === medId
+            ? {
+                ...m,
+                reminders: [
+                  ...sanitizeReminders(m.reminders),
+                  { ...reminder, notificationId },
+                ],
+              }
+            : m
+        )
+      );
+      setBanner(`Reminder set for ${formatReminderTime(reminder)}`);
+    } catch (e) {
+      setBanner('Could not schedule that reminder. Please try again.');
+    }
+  }, [ensureReminderPermission]);
+
+  const openReminderEditor = useCallback((medId, reminderId) => {
+    const med = medsRef.current.find((m) => m.id === medId);
+    const reminder = sanitizeReminders(med?.reminders).find((r) => r.id === reminderId);
+    if (!reminder) return;
+    let hour = clampHour(reminder.hour);
+    const am = hour < 12;
+    hour = hour % 12;
+    if (hour === 0) hour = 12;
+    setEditingReminder({
+      medId,
+      reminderId,
+      hour,
+      minute: clampMinute(reminder.minute),
+      am,
+    });
+  }, []);
+
+  const bumpReminderEdit = useCallback((field, delta) => {
+    setEditingReminder((prev) => {
+      if (!prev) return prev;
+      if (field === 'hour') {
+        let h = prev.hour + delta;
+        if (h > 12) h = 1;
+        if (h < 1) h = 12;
+        return { ...prev, hour: h };
+      }
+      if (field === 'minute') {
+        let m = prev.minute + delta;
+        if (m > 59) m -= 60;
+        if (m < 0) m += 60;
+        return { ...prev, minute: m };
+      }
+      return { ...prev, am: !prev.am };
+    });
+  }, []);
+
+  const saveEditedReminder = useCallback(async () => {
+    const editing = editingReminder;
+    if (!editing) return;
+    const med = medsRef.current.find((m) => m.id === editing.medId);
+    const reminder = sanitizeReminders(med?.reminders).find(
+      (r) => r.id === editing.reminderId
+    );
+    if (!med || !reminder) {
+      setEditingReminder(null);
+      return;
+    }
+
+    const allowed = await ensureReminderPermission();
+    if (!allowed) return;
+
+    let h24 = editing.hour % 12;
+    if (!editing.am) h24 += 12;
+    const nextReminder = {
+      ...reminder,
+      hour: clampHour(h24),
+      minute: clampMinute(editing.minute),
+      notificationId: null,
+    };
+
+    try {
+      await cancelReminderNotification(reminder);
+      const notificationId = await scheduleDoseReminder(med, nextReminder);
+      setMeds((prev) =>
+        prev.map((m) =>
+          m.id === editing.medId
+            ? {
+                ...m,
+                reminders: sanitizeReminders(m.reminders).map((r) =>
+                  r.id === editing.reminderId ? { ...nextReminder, notificationId } : r
+                ),
+              }
+            : m
+        )
+      );
+      setEditingReminder(null);
+      setBanner(`Reminder updated to ${formatReminderTime(nextReminder)}`);
+    } catch (e) {
+      setBanner('Could not update that reminder. Please try again.');
+    }
+  }, [editingReminder, ensureReminderPermission]);
+
+  const deleteReminder = useCallback((medId, reminderId) => {
+    const med = medsRef.current.find((m) => m.id === medId);
+    const reminder = sanitizeReminders(med?.reminders).find((r) => r.id === reminderId);
+    cancelReminderNotification(reminder).catch(() => {});
+    setMeds((prev) =>
+      prev.map((m) =>
+        m.id === medId
+          ? {
+              ...m,
+              reminders: sanitizeReminders(m.reminders).filter((r) => r.id !== reminderId),
+            }
+          : m
+      )
+    );
+    setBanner('Reminder removed');
   }, []);
 
   // ---- Derived values ----
@@ -844,8 +1722,43 @@ export default function App() {
   const editingMed = editingTime
     ? meds.find((m) => m.id === editingTime.medId)
     : null;
+  const editingReminderMed = editingReminder
+    ? meds.find((m) => m.id === editingReminder.medId)
+    : null;
 
   // ---- Render ----
+  const canUseApp = hasPurchasedFullUnlock || trialStatus.isTrialActive;
+  const waitingForInitialRestore =
+    accessLoaded &&
+    !hasPurchasedFullUnlock &&
+    !trialStatus.isTrialActive &&
+    !initialRestoreChecked;
+
+  if (!accessLoaded || waitingForInitialRestore) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
+        <View style={styles.accessLoading}>
+          <Text style={styles.accessLoadingText}>Loading EyeTally...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!canUseApp) {
+    return (
+      <PaywallScreen
+        styles={styles}
+        themeName={themeName}
+        onPurchase={handlePurchaseFullUnlock}
+        onRestore={handleRestorePurchases}
+        purchaseBusy={purchaseBusy}
+        restoreBusy={restoreBusy}
+        error={paywallError}
+      />
+    );
+  }
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
@@ -911,6 +1824,14 @@ export default function App() {
           </View>
         </View>
 
+        {!hasPurchasedFullUnlock && trialStatus.isTrialActive && (
+          <View style={styles.trialBanner}>
+            <Text style={styles.trialBannerText}>
+              Free trial: {trialStatus.daysRemaining} {trialStatus.daysRemaining === 1 ? 'day' : 'days'} left
+            </Text>
+          </View>
+        )}
+
         {meds.length === 0 && !editMode && (
           <Text style={styles.emptyText}>
             No medications yet.{'\n'}Tap Edit to add one.
@@ -926,6 +1847,9 @@ export default function App() {
               onUpdate={updateMed}
               onBumpTarget={bumpTarget}
               onDelete={deleteMed}
+              onAddReminder={addReminder}
+              onEditReminder={openReminderEditor}
+              onDeleteReminder={deleteReminder}
               styles={styles}
               theme={theme}
             />
@@ -973,6 +1897,15 @@ export default function App() {
         onSave={saveEditedTime}
         onDelete={deleteEditedTime}
         onCancel={() => setEditingTime(null)}
+        styles={styles}
+      />
+
+      <ReminderTimeModal
+        editing={editingReminder}
+        medName={editingReminderMed ? editingReminderMed.name || 'Medication' : ''}
+        onBump={bumpReminderEdit}
+        onSave={saveEditedReminder}
+        onCancel={() => setEditingReminder(null)}
         styles={styles}
       />
 
@@ -1107,6 +2040,18 @@ const makeStyles = (t) => StyleSheet.create({
 
   scroll: { padding: 18, paddingBottom: 44 },
 
+  accessLoading: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  accessLoadingText: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: t.ink,
+  },
+
   headerRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -1125,6 +2070,23 @@ const makeStyles = (t) => StyleSheet.create({
   headline: {
     fontSize: 22, fontWeight: '600', color: t.ink,
     marginTop: 14, letterSpacing: -0.3,
+  },
+
+  trialBanner: {
+    backgroundColor: t.cream,
+    borderWidth: 1,
+    borderColor: t.hairline,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginTop: -8,
+    marginBottom: 14,
+  },
+  trialBannerText: {
+    color: t.ink,
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
   },
 
   editToggle: {
@@ -1194,6 +2156,7 @@ const makeStyles = (t) => StyleSheet.create({
   },
 
   pressed: { opacity: 0.6 },
+  disabled: { opacity: 0.55 },
 
   timeRow: {
     flexDirection: 'row', flexWrap: 'wrap', marginTop: 12,
@@ -1262,6 +2225,60 @@ const makeStyles = (t) => StyleSheet.create({
   colorSwatchSelected: { borderColor: t.ink, borderWidth: 3 },
   colorCheck: { color: '#FFFFFF', fontSize: 16, fontWeight: '700' },
 
+  remindersSection: {
+    marginTop: 18,
+    paddingTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: t.divider,
+  },
+  remindersTitle: {
+    fontSize: 15,
+    color: t.inkSoft,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  reminderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  reminderTimeBtn: {
+    backgroundColor: t.cream,
+    borderWidth: 1,
+    borderColor: t.hairline,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    minWidth: 108,
+    alignItems: 'center',
+  },
+  reminderTimeText: {
+    fontSize: 16,
+    color: t.ink,
+    fontWeight: '600',
+  },
+  reminderRemoveBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  reminderRemoveText: {
+    color: t.danger,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  addReminderBtn: {
+    alignSelf: 'flex-start',
+    paddingVertical: 8,
+    paddingHorizontal: 2,
+  },
+  addReminderText: {
+    color: t.ink,
+    fontSize: 15,
+    fontWeight: '600',
+    textDecorationLine: 'underline',
+  },
+
   banner: {
     position: 'absolute', bottom: 30, left: 20, right: 20,
     backgroundColor: t.ink, borderRadius: 12, padding: 14,
@@ -1311,6 +2328,69 @@ const makeStyles = (t) => StyleSheet.create({
   modalDeleteText: { color: t.danger, fontSize: 15, fontWeight: '600' },
   modalCancel: { paddingVertical: 8, alignItems: 'center' },
   modalCancelText: { color: t.inkSoft, fontSize: 15, fontWeight: '500' },
+
+  paywallWrap: {
+    flex: 1,
+    justifyContent: 'center',
+    padding: 22,
+  },
+  paywallCard: {
+    backgroundColor: t.card,
+    borderWidth: 1,
+    borderColor: t.hairline,
+    borderRadius: 16,
+    padding: 24,
+  },
+  paywallEyebrow: {
+    color: t.inkSoft,
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: 14,
+    textTransform: 'uppercase',
+  },
+  paywallTitle: {
+    color: t.ink,
+    fontSize: 28,
+    fontWeight: '700',
+    lineHeight: 34,
+  },
+  paywallBody: {
+    color: t.inkSoft,
+    fontSize: 17,
+    lineHeight: 24,
+    marginTop: 12,
+    marginBottom: 22,
+  },
+  paywallError: {
+    color: t.danger,
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 14,
+  },
+  paywallButton: {
+    backgroundColor: t.ink,
+    borderRadius: 12,
+    paddingVertical: 15,
+    paddingHorizontal: 18,
+    alignItems: 'center',
+  },
+  paywallButtonText: {
+    color: t.card,
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  restoreLink: {
+    alignSelf: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    marginTop: 8,
+  },
+  restoreLinkText: {
+    color: t.ink,
+    fontSize: 16,
+    fontWeight: '600',
+    textDecorationLine: 'underline',
+  },
 
   suggestionList: {
     backgroundColor: t.cream,
