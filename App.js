@@ -18,6 +18,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   endConnection,
+  fetchProducts,
   finishTransaction,
   getAvailablePurchases,
   initConnection,
@@ -1228,6 +1229,7 @@ export default function App() {
     (async () => {
       try {
         await initConnection();
+        if (alive) await fetchProducts({ skus: [FULL_UNLOCK_SKU], type: 'in-app' });
         if (alive) await restorePurchases();
       } catch (error) {
         if (alive) {
