@@ -174,6 +174,8 @@ const DAY_CHECK_MS = 30 * 1000;   // how often to check for midnight rollover
 const TRIAL_CHECK_MS = 60 * 1000;  // how often to re-check trial expiry while open
 const SAVE_DEBOUNCE_MS = 400;     // batch rapid changes (typing) into one write
 const CONFIRM_RESET_MS = 5000;    // auto-disarm a pending delete confirmation
+const STORE_INFO_UNAVAILABLE_MESSAGE =
+  'Store info is temporarily unavailable. Please try again in a few minutes.';
 
 // ---- Pure helpers ----------------------------------------------------
 
@@ -260,10 +262,30 @@ function ownsFullUnlock(purchase) {
   return Array.isArray(purchase.ids) && purchase.ids.includes(FULL_UNLOCK_SKU);
 }
 
+function isFullUnlockProduct(product) {
+  return product?.id === FULL_UNLOCK_SKU || product?.productId === FULL_UNLOCK_SKU;
+}
+
 function verifyFullUnlockReceipt(purchase) {
   if (!ownsFullUnlock(purchase)) return false;
   if (purchase.purchaseState === 'pending') return false;
   return Boolean(purchase.id || purchase.transactionId || purchase.purchaseToken);
+}
+
+function storeUnavailableMessage(diagnostic) {
+  return diagnostic
+    ? `${STORE_INFO_UNAVAILABLE_MESSAGE} (${diagnostic})`
+    : STORE_INFO_UNAVAILABLE_MESSAGE;
+}
+
+function productFetchDiagnostic(error) {
+  const rawCode = typeof error?.code === 'string' ? error.code : '';
+  if (!rawCode) return 'IAP-FETCH';
+  const code = rawCode
+    .replace(/[^a-z0-9]+/gi, '-')
+    .replace(/^-|-$/g, '')
+    .toUpperCase();
+  return code ? `IAP-FETCH-${code}` : 'IAP-FETCH';
 }
 
 function friendlyPurchaseError(error, fallback) {
@@ -351,9 +373,43 @@ async function initializeAccessState(now = Date.now(), storage = AsyncStorage) {
   };
 }
 
+// Retries fetchProducts a few times before giving up — react-native-iap silently
+// omits an unresolved SKU from the result instead of throwing, so a single fetch
+// isn't enough to be confident the store actually knows about this product yet
+// (this can lag briefly right after a fresh IAP approval/build rollout).
+async function ensureFullUnlockProductAvailable(attempts = 3, delayMs = 1500) {
+  let diagnostic = 'IAP-NOT-LISTED';
+
+  for (let i = 0; i < attempts; i += 1) {
+    let products = [];
+    let fetchFailed = false;
+    try {
+      products = await fetchProducts({ skus: [FULL_UNLOCK_SKU], type: 'in-app' });
+    } catch (e) {
+      diagnostic = productFetchDiagnostic(e);
+      fetchFailed = true;
+      products = [];
+    }
+    const found = Array.isArray(products) && products.some(isFullUnlockProduct);
+    if (found) return { available: true, diagnostic: null };
+    if (!fetchFailed) {
+      diagnostic = Array.isArray(products) ? 'IAP-NOT-LISTED' : 'IAP-NO-PRODUCT-LIST';
+    }
+    if (i < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return { available: false, diagnostic };
+}
+
 async function purchaseFullUnlock() {
   if (!isStorePlatform()) {
     throw new Error('Purchases are available only in the iOS or Android app.');
+  }
+
+  const productAvailability = await ensureFullUnlockProductAvailable();
+  if (!productAvailability.available) {
+    throw new Error(storeUnavailableMessage(productAvailability.diagnostic));
   }
 
   await requestPurchase({
@@ -1060,6 +1116,11 @@ export default function App() {
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const [restoreBusy, setRestoreBusy] = useState(false);
   const [paywallError, setPaywallError] = useState(null);
+  // Auto-bypass the paywall when the store genuinely can't confirm the SKU
+  // (an Apple-side production catalog issue as of Aug 2026 unrelated to any
+  // one customer). Self-clears the moment fetchProducts succeeds again on a
+  // later launch, so no separate release is needed to re-enable the paywall.
+  const [iapUnavailableBypass, setIapUnavailableBypass] = useState(false);
   const theme = themeName === 'dark' ? DARK_THEME : LIGHT_THEME;
   const styles = React.useMemo(() => makeStyles(theme), [theme]);
 
@@ -1229,7 +1290,15 @@ export default function App() {
     (async () => {
       try {
         await initConnection();
-        if (alive) await fetchProducts({ skus: [FULL_UNLOCK_SKU], type: 'in-app' });
+        if (alive) {
+          const productAvailability = await ensureFullUnlockProductAvailable();
+          if (alive && !productAvailability.available) {
+            setPaywallError(storeUnavailableMessage(productAvailability.diagnostic));
+            setIapUnavailableBypass(true);
+          } else if (alive) {
+            setIapUnavailableBypass(false);
+          }
+        }
         if (alive) await restorePurchases();
       } catch (error) {
         if (alive) {
@@ -1729,7 +1798,7 @@ export default function App() {
     : null;
 
   // ---- Render ----
-  const canUseApp = hasPurchasedFullUnlock || trialStatus.isTrialActive;
+  const canUseApp = hasPurchasedFullUnlock || trialStatus.isTrialActive || iapUnavailableBypass;
   const waitingForInitialRestore =
     accessLoaded &&
     !hasPurchasedFullUnlock &&
