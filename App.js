@@ -16,16 +16,6 @@ import {
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  endConnection,
-  fetchProducts,
-  finishTransaction,
-  getAvailablePurchases,
-  initConnection,
-  purchaseErrorListener,
-  purchaseUpdatedListener,
-  requestPurchase,
-} from 'react-native-iap';
 
 // =====================================================================
 // EyeTally — daily eye drop tally
@@ -158,24 +148,15 @@ const DARK_THEME = {
 // existing DEFAULT_MEDS colors already come from this list.
 
 const STORAGE_KEY = 'eyedrop-tracker-v3';
-const TRIAL_START_KEY = 'eyetally_trial_start';
-const FULL_UNLOCK_KEY = 'eyetally_full_unlock';
-const TRIAL_MIGRATION_KEY = 'eyetally_migration_v1_5_complete';
-const FULL_UNLOCK_SKU = 'com.mulcahy.itally.fullunlock';
 const REMINDER_CATEGORY_ID = 'eyetally_dose_reminder';
 const REMINDER_MARK_TAKEN_ACTION_ID = 'eyetally_mark_taken';
 const REMINDER_NOTIFICATION_TYPE = 'eyetally-dose-reminder';
 const REMINDER_CHANNEL_ID = 'eyetally-reminders';
 const MIN_TARGET = 1;
 const MAX_TARGET = 24;
-const DAY_MS = 24 * 60 * 60 * 1000;
-const TRIAL_LENGTH_MS = 3 * DAY_MS;
 const DAY_CHECK_MS = 30 * 1000;   // how often to check for midnight rollover
-const TRIAL_CHECK_MS = 60 * 1000;  // how often to re-check trial expiry while open
 const SAVE_DEBOUNCE_MS = 400;     // batch rapid changes (typing) into one write
 const CONFIRM_RESET_MS = 5000;    // auto-disarm a pending delete confirmation
-const STORE_INFO_UNAVAILABLE_MESSAGE =
-  'Store info is temporarily unavailable. Please try again in a few minutes.';
 
 // ---- Pure helpers ----------------------------------------------------
 
@@ -250,175 +231,6 @@ function makeReminderFromDate(date = new Date()) {
     minute: d.getMinutes(),
     notificationId: null,
   };
-}
-
-function isStorePlatform() {
-  return Platform.OS === 'ios' || Platform.OS === 'android';
-}
-
-function ownsFullUnlock(purchase) {
-  if (!purchase || typeof purchase !== 'object') return false;
-  if (purchase.productId === FULL_UNLOCK_SKU) return true;
-  return Array.isArray(purchase.ids) && purchase.ids.includes(FULL_UNLOCK_SKU);
-}
-
-function isFullUnlockProduct(product) {
-  return product?.id === FULL_UNLOCK_SKU || product?.productId === FULL_UNLOCK_SKU;
-}
-
-function verifyFullUnlockReceipt(purchase) {
-  if (!ownsFullUnlock(purchase)) return false;
-  if (purchase.purchaseState === 'pending') return false;
-  return Boolean(purchase.id || purchase.transactionId || purchase.purchaseToken);
-}
-
-function storeUnavailableMessage(diagnostic) {
-  return diagnostic
-    ? `${STORE_INFO_UNAVAILABLE_MESSAGE} (${diagnostic})`
-    : STORE_INFO_UNAVAILABLE_MESSAGE;
-}
-
-function productFetchDiagnostic(error) {
-  const rawCode = typeof error?.code === 'string' ? error.code : '';
-  if (!rawCode) return 'IAP-FETCH';
-  const code = rawCode
-    .replace(/[^a-z0-9]+/gi, '-')
-    .replace(/^-|-$/g, '')
-    .toUpperCase();
-  return code ? `IAP-FETCH-${code}` : 'IAP-FETCH';
-}
-
-function friendlyPurchaseError(error, fallback) {
-  const message = typeof error?.message === 'string' ? error.message : '';
-  if (message.toLowerCase().includes('cancel')) return 'Purchase cancelled.';
-  return message || fallback;
-}
-
-async function hasPreExistingAppData(storage = AsyncStorage) {
-  const raw = await storage.getItem(STORAGE_KEY);
-  if (!raw) return false;
-
-  try {
-    const saved = JSON.parse(raw);
-    return Boolean(
-      sanitizeMeds(saved?.meds) ||
-      saved?.date ||
-      saved?.theme === 'dark' ||
-      saved?.theme === 'light' ||
-      Object.values(saved?.times || {}).some(
-        (arr) => Array.isArray(arr) && arr.length > 0
-      )
-    );
-  } catch (e) {
-    return true;
-  }
-}
-
-async function getTrialStatus(now = Date.now(), storage = AsyncStorage) {
-  let rawStart = await storage.getItem(TRIAL_START_KEY);
-  let trialStart = Number(rawStart);
-
-  if (!rawStart || !Number.isFinite(trialStart) || trialStart <= 0) {
-    trialStart = now;
-    await storage.setItem(TRIAL_START_KEY, String(trialStart));
-  }
-
-  const msRemaining = trialStart + TRIAL_LENGTH_MS - now;
-  return {
-    isTrialActive: msRemaining > 0,
-    daysRemaining: Math.max(0, Math.ceil(msRemaining / DAY_MS)),
-  };
-}
-
-async function getStoredFullUnlock(storage = AsyncStorage) {
-  return (await storage.getItem(FULL_UNLOCK_KEY)) === 'true';
-}
-
-async function storeFullUnlock(value, storage = AsyncStorage) {
-  await storage.setItem(FULL_UNLOCK_KEY, value ? 'true' : 'false');
-}
-
-async function initializeAccessState(now = Date.now(), storage = AsyncStorage) {
-  const purchased = await getStoredFullUnlock(storage);
-  const migrationComplete = (await storage.getItem(TRIAL_MIGRATION_KEY)) === 'true';
-
-  if (purchased) {
-    if (!migrationComplete) {
-      await storage.setItem(TRIAL_MIGRATION_KEY, 'true');
-    }
-    return {
-      hasPurchasedFullUnlock: true,
-      trialStatus: { isTrialActive: false, daysRemaining: 0 },
-    };
-  }
-
-  const rawTrialStart = await storage.getItem(TRIAL_START_KEY);
-
-  if (!migrationComplete) {
-    if (!rawTrialStart && (await hasPreExistingAppData(storage))) {
-      await storeFullUnlock(true, storage);
-      await storage.setItem(TRIAL_MIGRATION_KEY, 'true');
-      return {
-        hasPurchasedFullUnlock: true,
-        trialStatus: { isTrialActive: false, daysRemaining: 0 },
-      };
-    }
-
-    await storage.setItem(TRIAL_MIGRATION_KEY, 'true');
-  }
-
-  return {
-    hasPurchasedFullUnlock: false,
-    trialStatus: await getTrialStatus(now, storage),
-  };
-}
-
-// Retries fetchProducts a few times before giving up — react-native-iap silently
-// omits an unresolved SKU from the result instead of throwing, so a single fetch
-// isn't enough to be confident the store actually knows about this product yet
-// (this can lag briefly right after a fresh IAP approval/build rollout).
-async function ensureFullUnlockProductAvailable(attempts = 3, delayMs = 1500) {
-  let diagnostic = 'IAP-NOT-LISTED';
-
-  for (let i = 0; i < attempts; i += 1) {
-    let products = [];
-    let fetchFailed = false;
-    try {
-      products = await fetchProducts({ skus: [FULL_UNLOCK_SKU], type: 'in-app' });
-    } catch (e) {
-      diagnostic = productFetchDiagnostic(e);
-      fetchFailed = true;
-      products = [];
-    }
-    const found = Array.isArray(products) && products.some(isFullUnlockProduct);
-    if (found) return { available: true, diagnostic: null };
-    if (!fetchFailed) {
-      diagnostic = Array.isArray(products) ? 'IAP-NOT-LISTED' : 'IAP-NO-PRODUCT-LIST';
-    }
-    if (i < attempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-  return { available: false, diagnostic };
-}
-
-async function purchaseFullUnlock() {
-  if (!isStorePlatform()) {
-    throw new Error('Purchases are available only in the iOS or Android app.');
-  }
-
-  const productAvailability = await ensureFullUnlockProductAvailable();
-  if (!productAvailability.available) {
-    throw new Error(storeUnavailableMessage(productAvailability.diagnostic));
-  }
-
-  await requestPurchase({
-    request: {
-      apple: { sku: FULL_UNLOCK_SKU },
-      google: { skus: [FULL_UNLOCK_SKU] },
-    },
-    type: 'in-app',
-  });
 }
 
 function notificationsAllowed(settings) {
@@ -1031,65 +843,6 @@ function ReminderTimeModal({ editing, medName, onBump, onSave, onCancel, styles 
   );
 }
 
-function PaywallScreen({
-  styles,
-  themeName,
-  onPurchase,
-  onRestore,
-  purchaseBusy,
-  restoreBusy,
-  error,
-}) {
-  const busy = purchaseBusy || restoreBusy;
-
-  return (
-    <SafeAreaView style={styles.safe}>
-      <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
-      <View style={styles.paywallWrap}>
-        <View style={styles.paywallCard}>
-          <Text style={styles.paywallEyebrow}>EyeTally</Text>
-          <Text style={styles.paywallTitle}>
-            Your 3-day free trial has ended.
-          </Text>
-          <Text style={styles.paywallBody}>
-            Unlock EyeTally to keep tracking your eye drops.
-          </Text>
-
-          {error ? <Text style={styles.paywallError}>{error}</Text> : null}
-
-          <Pressable
-            onPress={onPurchase}
-            disabled={busy}
-            style={({ pressed }) => [
-              styles.paywallButton,
-              busy && styles.disabled,
-              pressed && styles.pressed,
-            ]}
-          >
-            <Text style={styles.paywallButtonText}>
-              {purchaseBusy ? 'Starting purchase...' : 'Unlock for $2.99'}
-            </Text>
-          </Pressable>
-
-          <Pressable
-            onPress={onRestore}
-            disabled={busy}
-            style={({ pressed }) => [
-              styles.restoreLink,
-              busy && styles.disabled,
-              pressed && styles.pressed,
-            ]}
-          >
-            <Text style={styles.restoreLinkText}>
-              {restoreBusy ? 'Restoring...' : 'Restore Purchase'}
-            </Text>
-          </Pressable>
-        </View>
-      </View>
-    </SafeAreaView>
-  );
-}
-
 // ---- App --------------------------------------------------------------
 
 export default function App() {
@@ -1106,79 +859,8 @@ export default function App() {
   const [copiedSlug, setCopiedSlug] = useState(null);
   const [banner, setBanner] = useState(null);
   const [themeName, setThemeName] = useState('light');
-  const [accessLoaded, setAccessLoaded] = useState(false);
-  const [trialStatus, setTrialStatus] = useState({
-    isTrialActive: false,
-    daysRemaining: 0,
-  });
-  const [hasPurchasedFullUnlock, setHasPurchasedFullUnlock] = useState(false);
-  const [initialRestoreChecked, setInitialRestoreChecked] = useState(!isStorePlatform());
-  const [purchaseBusy, setPurchaseBusy] = useState(false);
-  const [restoreBusy, setRestoreBusy] = useState(false);
-  const [paywallError, setPaywallError] = useState(null);
-  // Auto-bypass the paywall when the store genuinely can't confirm the SKU
-  // (an Apple-side production catalog issue as of Aug 2026 unrelated to any
-  // one customer). Self-clears the moment fetchProducts succeeds again on a
-  // later launch, so no separate release is needed to re-enable the paywall.
-  const [iapUnavailableBypass, setIapUnavailableBypass] = useState(false);
   const theme = themeName === 'dark' ? DARK_THEME : LIGHT_THEME;
   const styles = React.useMemo(() => makeStyles(theme), [theme]);
-
-  const markFullUnlockPurchased = useCallback(async () => {
-    await storeFullUnlock(true);
-    setHasPurchasedFullUnlock(true);
-    setPaywallError(null);
-  }, []);
-
-  const refreshTrialState = useCallback(async () => {
-    const status = await getTrialStatus();
-    setTrialStatus(status);
-    return status;
-  }, []);
-
-  const restorePurchases = useCallback(async () => {
-    if (!isStorePlatform()) {
-      throw new Error('Restore is available only in the iOS or Android app.');
-    }
-
-    const purchases = await getAvailablePurchases();
-    const fullUnlock = purchases.find(ownsFullUnlock);
-    if (!fullUnlock || !verifyFullUnlockReceipt(fullUnlock)) return false;
-
-    await markFullUnlockPurchased();
-    return true;
-  }, [markFullUnlockPurchased]);
-
-  const handlePurchaseFullUnlock = useCallback(async () => {
-    setPaywallError(null);
-    setPurchaseBusy(true);
-    try {
-      await purchaseFullUnlock();
-    } catch (error) {
-      setPaywallError(
-        friendlyPurchaseError(error, 'Unable to start purchase. Please try again.')
-      );
-    } finally {
-      setPurchaseBusy(false);
-    }
-  }, []);
-
-  const handleRestorePurchases = useCallback(async () => {
-    setPaywallError(null);
-    setRestoreBusy(true);
-    try {
-      const restored = await restorePurchases();
-      if (!restored) {
-        setPaywallError('No previous EyeTally unlock was found.');
-      }
-    } catch (error) {
-      setPaywallError(
-        friendlyPurchaseError(error, 'Unable to restore purchase. Please try again.')
-      );
-    } finally {
-      setRestoreBusy(false);
-    }
-  }, [restorePurchases]);
 
   const copySiriLink = async (med) => {
     const url = `eyetally://log/${slugify(med.name)}`;
@@ -1224,100 +906,6 @@ export default function App() {
     showNotificationSettingsMessage();
     return false;
   }, [showNotificationSettingsMessage]);
-
-  // ---- Trial / purchase access ----
-  useEffect(() => {
-    let alive = true;
-
-    (async () => {
-      try {
-        const { trialStatus: status, hasPurchasedFullUnlock: purchased } =
-          await initializeAccessState();
-        if (!alive) return;
-        setTrialStatus(status);
-        setHasPurchasedFullUnlock(purchased);
-      } catch (e) {
-        if (!alive) return;
-        setTrialStatus({ isTrialActive: true, daysRemaining: 3 });
-        setHasPurchasedFullUnlock(false);
-      } finally {
-        if (alive) setAccessLoaded(true);
-      }
-    })();
-
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (hasPurchasedFullUnlock) return undefined;
-    const id = setInterval(() => {
-      refreshTrialState().catch(() => {});
-    }, TRIAL_CHECK_MS);
-    return () => clearInterval(id);
-  }, [hasPurchasedFullUnlock, refreshTrialState]);
-
-  useEffect(() => {
-    if (!isStorePlatform()) return undefined;
-    let alive = true;
-
-    const purchaseSub = purchaseUpdatedListener(async (purchase) => {
-      if (!verifyFullUnlockReceipt(purchase)) return;
-      setPurchaseBusy(true);
-      try {
-        await markFullUnlockPurchased();
-        await finishTransaction({ purchase, isConsumable: false });
-      } catch (error) {
-        if (alive) {
-          setPaywallError(
-            friendlyPurchaseError(error, 'Purchase completed, but finalization failed.')
-          );
-        }
-      } finally {
-        if (alive) setPurchaseBusy(false);
-      }
-    });
-
-    const errorSub = purchaseErrorListener((error) => {
-      if (!alive) return;
-      setPurchaseBusy(false);
-      setPaywallError(
-        friendlyPurchaseError(error, 'Purchase failed. Please try again.')
-      );
-    });
-
-    (async () => {
-      try {
-        await initConnection();
-        if (alive) {
-          const productAvailability = await ensureFullUnlockProductAvailable();
-          if (alive && !productAvailability.available) {
-            setPaywallError(storeUnavailableMessage(productAvailability.diagnostic));
-            setIapUnavailableBypass(true);
-          } else if (alive) {
-            setIapUnavailableBypass(false);
-          }
-        }
-        if (alive) await restorePurchases();
-      } catch (error) {
-        if (alive) {
-          setPaywallError(
-            friendlyPurchaseError(error, 'Purchases are unavailable right now.')
-          );
-        }
-      } finally {
-        if (alive) setInitialRestoreChecked(true);
-      }
-    })();
-
-    return () => {
-      alive = false;
-      purchaseSub.remove();
-      errorSub.remove();
-      endConnection().catch(() => {});
-    };
-  }, [markFullUnlockPurchased, restorePurchases]);
 
   // ---- Load once on start ----
   useEffect(() => {
@@ -1798,38 +1386,6 @@ export default function App() {
     : null;
 
   // ---- Render ----
-  const canUseApp = hasPurchasedFullUnlock || trialStatus.isTrialActive || iapUnavailableBypass;
-  const waitingForInitialRestore =
-    accessLoaded &&
-    !hasPurchasedFullUnlock &&
-    !trialStatus.isTrialActive &&
-    !initialRestoreChecked;
-
-  if (!accessLoaded || waitingForInitialRestore) {
-    return (
-      <SafeAreaView style={styles.safe}>
-        <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
-        <View style={styles.accessLoading}>
-          <Text style={styles.accessLoadingText}>Loading EyeTally...</Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
-  if (!canUseApp) {
-    return (
-      <PaywallScreen
-        styles={styles}
-        themeName={themeName}
-        onPurchase={handlePurchaseFullUnlock}
-        onRestore={handleRestorePurchases}
-        purchaseBusy={purchaseBusy}
-        restoreBusy={restoreBusy}
-        error={paywallError}
-      />
-    );
-  }
-
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle={themeName === 'dark' ? 'light-content' : 'dark-content'} />
@@ -1894,14 +1450,6 @@ export default function App() {
             </Pressable>
           </View>
         </View>
-
-        {!hasPurchasedFullUnlock && trialStatus.isTrialActive && (
-          <View style={styles.trialBanner}>
-            <Text style={styles.trialBannerText}>
-              Free trial: {trialStatus.daysRemaining} {trialStatus.daysRemaining === 1 ? 'day' : 'days'} left
-            </Text>
-          </View>
-        )}
 
         {meds.length === 0 && !editMode && (
           <Text style={styles.emptyText}>
@@ -2111,18 +1659,6 @@ const makeStyles = (t) => StyleSheet.create({
 
   scroll: { padding: 18, paddingBottom: 44 },
 
-  accessLoading: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-  },
-  accessLoadingText: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: t.ink,
-  },
-
   headerRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -2141,23 +1677,6 @@ const makeStyles = (t) => StyleSheet.create({
   headline: {
     fontSize: 22, fontWeight: '600', color: t.ink,
     marginTop: 14, letterSpacing: -0.3,
-  },
-
-  trialBanner: {
-    backgroundColor: t.cream,
-    borderWidth: 1,
-    borderColor: t.hairline,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    marginTop: -8,
-    marginBottom: 14,
-  },
-  trialBannerText: {
-    color: t.ink,
-    fontSize: 14,
-    fontWeight: '600',
-    textAlign: 'center',
   },
 
   editToggle: {
@@ -2227,7 +1746,6 @@ const makeStyles = (t) => StyleSheet.create({
   },
 
   pressed: { opacity: 0.6 },
-  disabled: { opacity: 0.55 },
 
   timeRow: {
     flexDirection: 'row', flexWrap: 'wrap', marginTop: 12,
@@ -2399,69 +1917,6 @@ const makeStyles = (t) => StyleSheet.create({
   modalDeleteText: { color: t.danger, fontSize: 15, fontWeight: '600' },
   modalCancel: { paddingVertical: 8, alignItems: 'center' },
   modalCancelText: { color: t.inkSoft, fontSize: 15, fontWeight: '500' },
-
-  paywallWrap: {
-    flex: 1,
-    justifyContent: 'center',
-    padding: 22,
-  },
-  paywallCard: {
-    backgroundColor: t.card,
-    borderWidth: 1,
-    borderColor: t.hairline,
-    borderRadius: 16,
-    padding: 24,
-  },
-  paywallEyebrow: {
-    color: t.inkSoft,
-    fontSize: 15,
-    fontWeight: '700',
-    marginBottom: 14,
-    textTransform: 'uppercase',
-  },
-  paywallTitle: {
-    color: t.ink,
-    fontSize: 28,
-    fontWeight: '700',
-    lineHeight: 34,
-  },
-  paywallBody: {
-    color: t.inkSoft,
-    fontSize: 17,
-    lineHeight: 24,
-    marginTop: 12,
-    marginBottom: 22,
-  },
-  paywallError: {
-    color: t.danger,
-    fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 14,
-  },
-  paywallButton: {
-    backgroundColor: t.ink,
-    borderRadius: 12,
-    paddingVertical: 15,
-    paddingHorizontal: 18,
-    alignItems: 'center',
-  },
-  paywallButtonText: {
-    color: t.card,
-    fontSize: 17,
-    fontWeight: '700',
-  },
-  restoreLink: {
-    alignSelf: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    marginTop: 8,
-  },
-  restoreLinkText: {
-    color: t.ink,
-    fontSize: 16,
-    fontWeight: '600',
-    textDecorationLine: 'underline',
-  },
 
   suggestionList: {
     backgroundColor: t.cream,
