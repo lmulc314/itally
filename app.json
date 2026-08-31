@@ -3,7 +3,7 @@
     "name": "EyeTally",
     "slug": "itally",
     "scheme": "eyetally",
-    "version": "1.0.7",
+    "version": "1.0.8",
     "orientation": "portrait",
     "plugins": [
       "expo-notifications"
